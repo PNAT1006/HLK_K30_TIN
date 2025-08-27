@@ -1,9 +1,11 @@
 import sys
 import csv
 import cv2
+import shutil
 import numpy as np
 from pathlib import Path
-
+from datetime import datetime
+from Cut_images import crop_from_csv  
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QPushButton, QWidget,
     QStackedWidget, QMessageBox, QLabel, QVBoxLayout, QHBoxLayout,
@@ -12,18 +14,16 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QIcon, QFont, QPixmap, QImage, QColor
 from PyQt6.QtCore import Qt, QRect, pyqtSignal, QPoint
 
-# --- Lấy thông tin màn hình (fallback nếu thiếu screeninfo) ---
 try:
     from screeninfo import get_monitors
     _screen = get_monitors()[0]
     SW, SH, SX, SY = _screen.width, _screen.height, _screen.x, _screen.y
 except Exception:
     SW, SH, SX, SY = 1280, 800, 0, 0
+EXPORT_ROOT = Path(__file__).resolve().parent / "exports"
 
-# --- ĐƯỜNG DẪN LƯU CSV CỐ ĐỊNH ---
-EXPORT_DIR = Path(__file__).resolve().parent / "exports"
-EXPORT_CSV = EXPORT_DIR / "boxes.csv"
 
+local_folder = " "
 
 # ====================== WIDGET PHỤ ======================
 class ClickableLabel(QLabel):
@@ -164,6 +164,11 @@ class Image_Processing(QWidget):
         self.cv_img_orig: np.ndarray | None = None   # ảnh gốc (BGR)
         self.img_rect = (0, 0, 0, 0)                 # (x0, y0, w, h) vùng ảnh thật trong label
 
+        # Thông tin phiên làm việc (thư mục cho mỗi ảnh import)
+        self.session_dir: Path | None = None
+        self.session_image_path: Path | None = None  # ảnh đã copy vào session
+        self.session_csv_path: Path | None = None    # boxes.csv trong session
+
         # Quản lý hình chữ nhật
         self.rect_manager = RectManager()
 
@@ -172,7 +177,7 @@ class Image_Processing(QWidget):
         self.btn_draw   = QPushButton("Chọn Vùng")
         self.btn_draw.setCheckable(True)
         self.btn_del    = QPushButton("Xóa box")
-        self.btn_export = QPushButton("Xác nhận")  # Xuất CSV (cố định)
+        self.btn_export = QPushButton("Xác nhận")  # Xuất CSV vào thư mục phiên
 
         self._btn_css_static = """
             QPushButton {
@@ -233,7 +238,11 @@ class Image_Processing(QWidget):
 
     def _update_buttons_state(self):
         self.btn_del.setEnabled(len(self.rect_manager.rects) > 0)
-        self.btn_export.setEnabled(self.cv_img_orig is not None and len(self.rect_manager.rects) > 0)
+        self.btn_export.setEnabled(
+            self.cv_img_orig is not None and
+            self.session_dir is not None and
+            len(self.rect_manager.rects) > 0
+        )
 
     # ---------------- Render: giữ AR gốc, letterbox ----------------
     def _render_display(self):
@@ -282,15 +291,15 @@ class Image_Processing(QWidget):
         yi = int(round(sy * (ih - 1)))
         return xi, yi
 
-    # ---------------- Export CSV (lưu cố định) ----------------
+    # ---------------- Export CSV (lưu vào thư mục của ảnh) ----------------
     def _export_csv(self):
-        if self.cv_img_orig is None or len(self.rect_manager.rects) == 0:
-            QMessageBox.warning(self, "Thiếu dữ liệu", "Chưa có ảnh hoặc chưa có box.")
+        if self.cv_img_orig is None or len(self.rect_manager.rects) == 0 or self.session_dir is None:
+            QMessageBox.warning(self, "Thiếu dữ liệu", "Chưa có ảnh, chưa có box, hoặc chưa tạo thư mục phiên.")
             return
 
+        path = self.session_csv_path if self.session_csv_path else (self.session_dir / "boxes.csv")
         try:
-            EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-            with EXPORT_CSV.open("w", newline="", encoding="utf-8") as f:
+            with path.open("w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 # Header: TL, TR, BR, BL (theo toạ độ ảnh gốc)
                 writer.writerow([
@@ -306,8 +315,12 @@ class Image_Processing(QWidget):
                     br = self._label_to_image_coord(x2l, y2l)
                     bl = self._label_to_image_coord(x1l, y2l)
                     writer.writerow([idx, tl[0], tl[1], tr[0], tr[1], br[0], br[1], bl[0], bl[1]])
+            if self.session_image_path is not None:
+                crop_from_csv(self.session_image_path, path, self.session_dir)
+            else:
+                QMessageBox.warning(self, "Thiếu ảnh", "Chưa chọn ảnh để crop.")
 
-            QMessageBox.information(self, "Thành công", f"Đã lưu CSV tại:\n{EXPORT_CSV}")
+            QMessageBox.information(self, "Thành công", f"Đã lưu CSV tại:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Lỗi", f"Không thể lưu CSV:\n{e}")
 
@@ -318,10 +331,39 @@ class Image_Processing(QWidget):
         )
         if not file:
             return
+
         img = cv2.imread(file)
         if img is None:
             QMessageBox.warning(self, "Lỗi", "Không mở được ảnh.")
             return
+
+        # 1) Tạo thư mục phiên mới: exports/<tên_ảnh>_<timestamp>/
+        try:
+            EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+            stem = Path(file).stem
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            local_folder = f"{stem}_{ts}"
+            print (local_folder)
+
+            self.session_dir = EXPORT_ROOT / f"{stem}_{ts}"
+            self.session_dir.mkdir(parents=True, exist_ok=True)
+
+            # 2) Copy ảnh gốc vào thư mục phiên
+            src = Path(file)
+            self.session_image_path = self.session_dir / src.name
+            shutil.copy2(src, self.session_image_path)
+
+            # 3) Đặt đường dẫn CSV cho phiên
+            self.session_csv_path = self.session_dir / "boxes.csv"
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi", f"Không thể tạo/copy vào thư mục phiên:\n{e}")
+            # vẫn cho hiển thị ảnh để bạn thao tác, nhưng không có session_dir
+            self.session_dir = None
+            self.session_image_path = None
+            self.session_csv_path = None
+
+        # 4) Nạp ảnh hiển thị & reset box
         self.cv_img_orig = img
         self.rect_manager.reset()
         self._update_buttons_state()
@@ -428,6 +470,7 @@ class MainMenu(QWidget):
         self.btn2.setGeometry(x0 + bw + spacing, y0, bw, bh)
 
 
+# ====================== MAIN WINDOW ======================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -460,6 +503,8 @@ class MainWindow(QMainWindow):
     def event_button_1(self):
         self.stack.setCurrentWidget(self.page_image)
 
+
+# ====================== ENTRY ======================
 def main():
     app = QApplication(sys.argv)
     w = MainWindow()
